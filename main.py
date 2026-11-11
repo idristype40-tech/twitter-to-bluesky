@@ -1,4 +1,5 @@
 import calendar
+import difflib
 import functools
 import io
 import json
@@ -11,7 +12,8 @@ from datetime import datetime
 
 import feedparser
 import requests
-from atproto import Client, models
+from atproto import Client, Request, models
+from httpx import Timeout
 from bs4 import BeautifulSoup
 from PIL import Image
 
@@ -310,7 +312,8 @@ def download_video(url):
 @functools.cache
 def get_client():
     """Log in once per run and reuse the connection."""
-    client = Client()
+    # The SDK's default timeout is 5 seconds, which is too short for video uploads
+    client = Client(request=Request(timeout=Timeout(timeout=300.0, connect=30.0)))
     client.login(BLUESKY_HANDLE, BLUESKY_PASSWORD)
     return client
 
@@ -340,6 +343,50 @@ def get_ocr():
     return RapidOCR()
 
 
+BRAND = "Infinity Nikki"
+
+
+def _word_score(word, target):
+    """How close is this word to `target`? Also finds the name stuck to other letters."""
+    w = re.sub(r"[^a-z]", "", word.lower())
+    if len(w) < 3:
+        return 0.0
+    best = difflib.SequenceMatcher(None, w, target).ratio()
+    n = len(target)
+    for size in (n - 1, n, n + 1):
+        for i in range(0, max(1, len(w) - size + 1)):
+            best = max(best, difflib.SequenceMatcher(None, w[i:i + size], target).ratio())
+    return best
+
+
+def _is_brand_word(word):
+    if re.sub(r"[^a-z]", "", word.lower()) == "infinite":   # a real word, not the brand
+        return False
+    return _word_score(word, "infinity") >= 0.75 or _word_score(word, "nikki") >= 0.8
+
+
+def fix_brand(text):
+    """Turn OCR misreads of 'Infinity Nikki' into the real name, and keep only one
+    instance of it per image (game art repeats the logo)."""
+    out, in_run = [], False
+    for w in text.split():
+        if _is_brand_word(w):
+            if not in_run:
+                out.append(BRAND)          # a run of matches becomes one name
+            in_run = True
+        else:
+            out.append(w)
+            in_run = False
+    result, seen = [], False
+    for w in out:
+        if w == BRAND:
+            if seen:
+                continue
+            seen = True
+        result.append(w)
+    return " ".join(result)
+
+
 def ocr_alt_text(data):
     """Read any text in the image and return it as alt text ('' if none found)."""
     if not OCR_ALT_TEXT:
@@ -355,8 +402,9 @@ def ocr_alt_text(data):
         return ""
     if not lines:
         return ""
-    print(f"Alt text: {' '.join(lines)[:80]}")
-    return ("Text in image: " + " ".join(lines))[:1000]
+    text = fix_brand(" ".join(lines))
+    print(f"Alt text: {text[:80]}")
+    return ("Text in image: " + text)[:1000]
 
 
 def build_embed(bsky, images, video_url):
@@ -490,13 +538,20 @@ def post_to_bluesky(text, images, video_url, thread=None):
             except Exception as e:
                 if not use_embed:
                     raise
-                print(f"Post with media failed ({describe(e)}); checking, then trying without media")
-                use_embed = None
-                # it may have gone through anyway (e.g. a timeout) - don't post it twice
-                hit = find_posted(recent_posts(20), chunk, parent.uri if parent else None,
-                                  time.time() - 600)
-                new = ref(hit["first"]) if hit else models.create_strong_ref(
-                    bsky.send_post(**args))
+                # The post may have gone through even though we got an error (e.g. a timeout).
+                # Check, and only treat it as missing if we could read our feed and it isn't there.
+                # We never re-send without the video: this tweet is retried next run instead.
+                print(f"Post with media failed ({describe(e)}); checking whether it went through")
+                time.sleep(15)                      # give Bluesky a moment to show the post
+                posts_now = recent_posts(30)
+                if posts_now is None:
+                    raise RuntimeError("could not check whether the video post went through; retrying next run")
+                hit = find_posted(posts_now, chunk, parent.uri if parent else None,
+                                  time.time() - 900)
+                if not hit:
+                    raise RuntimeError("video post did not go through; retrying next run")
+                print("The video post did go through; carrying on")
+                new = ref(hit["first"])
 
             root = root or new
             parent = new
