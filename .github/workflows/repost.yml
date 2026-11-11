@@ -1,4 +1,7 @@
 name: X → Bluesky repost
+concurrency:
+  group: repost
+  cancel-in-progress: false
 on:
   schedule:
     - cron: '*/30 * * * *'
@@ -36,6 +39,7 @@ jobs:
           git commit -m "chore: update seen ids" --allow-empty
           git remote set-url origin \
             https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          git pull --rebase -X theirs origin ${{ github.ref_name }}
           git push origin HEAD:${{ github.ref_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
