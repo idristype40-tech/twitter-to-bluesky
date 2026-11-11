@@ -17,7 +17,9 @@ from PIL import Image
 
 # ---------------------------------------------------------------- settings --
 TWITTER_USER = "InfinityNikkiEN"
-FEED_URL = f"https://xitter.cf/{TWITTER_USER}/rss"
+FEED_URLS = [                 # tried in order until one returns tweets (add backup mirrors here)
+    f"https://xitter.cf/{TWITTER_USER}/rss",
+]
 
 BLUESKY_HANDLE = os.environ["BLUESKY_HANDLE"]
 BLUESKY_PASSWORD = os.environ["BLUESKY_PASSWORD"]
@@ -136,13 +138,32 @@ def find_video(tweet_path):
     return None
 
 
+def read_feed():
+    """Download the RSS feed and return its entries, trying each address in FEED_URLS.
+    Stops the run with a clear message if none of them gives us anything."""
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                             "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+    for url in FEED_URLS:
+        try:
+            resp = requests.get(url, headers=headers, timeout=30)
+            print(f"Feed {url} -> HTTP {resp.status_code}, {len(resp.content)} bytes, "
+                  f"{resp.headers.get('content-type')}")
+            entries = feedparser.parse(resp.content).entries
+            if entries:
+                return entries
+            print("No tweets in the feed. Start of the response:", resp.text[:300].replace("\n", " "))
+        except Exception as e:
+            print(f"Feed download failed ({url}): {describe(e)}")
+    raise SystemExit("Could not get any tweets from the feed (see the messages above)")
+
+
 def fetch_tweets():
     tweets = []
     # In the feed, a tweet's own replies sit directly below it, so a self-reply
     # belongs to the last "main" tweet we passed.
     current_root = None
 
-    for entry in feedparser.parse(FEED_URL).entries[:20]:
+    for entry in read_feed()[:20]:
         title = entry.title.strip()
         low = title.lower()
 
