@@ -29,11 +29,11 @@ FIRST_RUN_LIMIT = 10
 
 MAX_ATTEMPTS = 3               # give up on a tweet that fails to post this many runs in a row
 VIDEO_WAIT_SECONDS = 180       # how long to wait for Bluesky to finish processing a video
-OCR_ALT_TEXT = True            # read text inside images and use it as alt text
+OCR_ALT_TEXT = False            # read text inside images and use it as alt text
 OCR_LANGS = "eng"              # tesseract language code(s), e.g. "eng+chi_sim"
 
 BSKY_MAX_DURATION = 600                 # 10 minutes in seconds
-BSKY_MAX_BYTES = 50 * 1024 * 1024       # keep uploads small so they go through reliably
+BSKY_MAX_BYTES = 100 * 1024 * 1024       # keep uploads small so they go through reliably
 BSKY_MAX_HEIGHT = 1080
 
 
