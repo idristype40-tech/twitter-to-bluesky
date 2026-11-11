@@ -17,9 +17,10 @@ from PIL import Image
 
 # ---------------------------------------------------------------- settings --
 TWITTER_USER = "InfinityNikkiEN"
-FEED_URLS = [                 # tried in order until one returns tweets (add backup mirrors here)
-    f"https://xitter.cf/{TWITTER_USER}/rss",
+FEED_HOSTS = [                # mirrors tried in order until one returns tweets
+    "https://xitter.cf",      # add backup mirrors here, e.g. "https://some-other-mirror.example"
 ]
+feed_host = FEED_HOSTS[0]     # the mirror that actually worked this run (set by read_feed)
 
 BLUESKY_HANDLE = os.environ["BLUESKY_HANDLE"]
 BLUESKY_PASSWORD = os.environ["BLUESKY_PASSWORD"]
@@ -63,7 +64,7 @@ def save_state(seen, threads, fails):
 def clean_text(text):
     """Tidy tweet text: keep line breaks, drop blank lines and extra spaces."""
     text = text.replace("\xa0", " ").replace("\r", "")
-    text = text.replace("https://xitter.cf/t.co/", "https://t.co/")
+    text = re.sub(r"https?://[^/\s]+/t\.co/", "https://t.co/", text)   # mirror's copy of a t.co link
     lines = [" ".join(line.split()) for line in text.split("\n")]
     return "\n".join(line for line in lines if line)
 
@@ -112,10 +113,10 @@ def describe(e):
 
 # ------------------------------------------------------------- fetch tweets --
 def find_video(tweet_path):
-    """Find a direct .mp4 link for a tweet: xitter.cf page first, vxtwitter API as backup."""
+    """Find a direct .mp4 link for a tweet: the mirror's page first, vxtwitter API as backup."""
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        html = requests.get("https://xitter.cf" + tweet_path, headers=headers, timeout=15).text
+        html = requests.get(feed_host + tweet_path, headers=headers, timeout=15).text
         links = re.findall(r'''https://video\.twimg\.com/[^\s"'<>)]+\.mp4[^\s"'<>)]*''', html)
         if links:
             def pixels(link):               # prefer the biggest resolution
@@ -123,7 +124,7 @@ def find_video(tweet_path):
                 return int(m[1]) * int(m[2]) if m else 0
             return max(links, key=pixels).replace("&amp;", "&")
     except Exception as e:
-        print(f"xitter video lookup failed: {e}")
+        print(f"Mirror video lookup failed: {e}")
     try:
         data = requests.get("https://api.vxtwitter.com" + tweet_path,
                             headers=headers, timeout=10).json()
@@ -139,21 +140,36 @@ def find_video(tweet_path):
 
 
 def read_feed():
-    """Download the RSS feed and return its entries, trying each address in FEED_URLS.
-    Stops the run with a clear message if none of them gives us anything."""
+    """Download the RSS feed and return its entries. Each mirror in FEED_HOSTS is tried
+    (a few times if it says "too many requests"). Stops with a clear message if none works."""
+    global feed_host
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
-    for url in FEED_URLS:
-        try:
-            resp = requests.get(url, headers=headers, timeout=30)
-            print(f"Feed {url} -> HTTP {resp.status_code}, {len(resp.content)} bytes, "
-                  f"{resp.headers.get('content-type')}")
-            entries = feedparser.parse(resp.content).entries
-            if entries:
-                return entries
-            print("No tweets in the feed. Start of the response:", resp.text[:300].replace("\n", " "))
-        except Exception as e:
-            print(f"Feed download failed ({url}): {describe(e)}")
+    for host in FEED_HOSTS:
+        url = f"{host}/{TWITTER_USER}/rss"
+        for attempt in range(1, 4):
+            wait = 10 * attempt
+            try:
+                resp = requests.get(url, headers=headers, timeout=30)
+            except Exception as e:
+                print(f"Feed download failed ({url}): {describe(e)}")
+            else:
+                print(f"Feed {url} -> HTTP {resp.status_code} (attempt {attempt}/3)")
+                entries = feedparser.parse(resp.content).entries if resp.ok else []
+                if entries:
+                    feed_host = host
+                    return entries
+                page = BeautifulSoup(resp.text, "html.parser").get_text(" ")
+                print("No tweets. The page says:", " ".join(page.split())[:300])
+                if resp.status_code not in (429, 500, 502, 503, 504):
+                    break                                  # retrying won't help
+                try:
+                    wait = min(max(int(resp.headers.get("Retry-After", 0)), wait), 60)
+                except ValueError:
+                    pass
+            if attempt < 3:
+                print(f"Trying again in {wait}s")
+                time.sleep(wait)
     raise SystemExit("Could not get any tweets from the feed (see the messages above)")
 
 
@@ -178,7 +194,8 @@ def fetch_tweets():
         if is_reply and not low.startswith(f"r to @{TWITTER_USER.lower()}"):
             continue                       # a reply to somebody else
 
-        tweet_id = entry.guid
+        id_match = re.search(r"/status/(\d+)", entry.guid)
+        tweet_id = id_match[1] if id_match else entry.guid     # same id whichever mirror we used
         parent_id = current_root if is_reply else None
         if not is_reply:
             current_root = tweet_id
@@ -194,14 +211,12 @@ def fetch_tweets():
         text = first_p.get_text() if first_p else re.sub(r"^R to @\w+:\s*", "", title)
 
         # A video shows up as a thumbnail linking to the tweet
-        video_url = None
+        video_path = None
         for a in soup.find_all("a", href=True):
             img = a.find("img")
             if "/status/" in a["href"] and img and "amplify_video_thumb" in img.get("src", ""):
                 href = a["href"].split("#")[0]
-                path = "/" + href.split("/", 3)[3] if href.startswith("http") else href
-                video_url = find_video(path)
-                print(f"Video detected → {video_url}")
+                video_path = "/" + href.split("/", 3)[3] if href.startswith("http") else href
                 break
 
         # Images (skip video thumbnails, which sit inside a link to the tweet)
@@ -219,7 +234,7 @@ def fetch_tweets():
             "id": tweet_id,
             "text": clean_text(text),
             "images": images,
-            "video_url": video_url,
+            "video_path": video_path,       # looked up (find_video) only if we post this tweet
             "is_reply": is_reply,
             "parent_id": parent_id,
             "time": calendar.timegm(published) if published else 0,
@@ -334,7 +349,7 @@ def ocr_alt_text(data):
         img = np.array(Image.open(io.BytesIO(data)).convert("RGB"))[:, :, ::-1]   # RGB -> BGR
         result = get_ocr()(img)
         lines = [t.strip() for t, score in zip(result.txts or (), result.scores or ())
-                 if score >= OCR_MIN_SCORE and t.strip()]
+                 if score >= OCR_MIN_SCORE and sum(c.isalpha() for c in t) >= 3]   # skip icon/number junk
     except Exception as e:
         print(f"OCR skipped: {describe(e)}")
         return ""
@@ -525,7 +540,7 @@ def main():
 
     for tw in pending:                # oldest first, so a tweet goes out before its replies
         label = tw["text"][:60]
-        if not (tw["text"] or tw["images"] or tw["video_url"]):
+        if not (tw["text"] or tw["images"] or tw["video_path"]):
             seen.add(tw["id"])
             continue
 
@@ -561,7 +576,10 @@ def main():
             }
         else:
             print("Posting reply:" if thread else "Reposting:", label)
-            result = post_to_bluesky(tw["text"], tw["images"], tw["video_url"], thread)
+            video_url = find_video(tw["video_path"]) if tw["video_path"] else None
+            if tw["video_path"]:
+                print(f"Video detected → {video_url}")
+            result = post_to_bluesky(tw["text"], tw["images"], video_url, thread)
 
         if result:
             if thread:
