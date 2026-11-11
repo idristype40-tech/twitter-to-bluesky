@@ -8,7 +8,7 @@ import feedparser
 from bs4 import BeautifulSoup
 from atproto import Client, models
 
-NITTER_RSS = "https://nitter.net/official_artms/rss"
+NITTER_RSS = "https://xitter.cf/InfinityNikkiEN/rss"
 BLUESKY_HANDLE = os.environ["BLUESKY_HANDLE"]
 BLUESKY_PASSWORD = os.environ["BLUESKY_PASSWORD"]
 STATE_FILE = "seen_ids.json"
@@ -72,15 +72,25 @@ def fetch_media_from_vxtwitter(tweet_path):
 def fetch_tweets():
     feed = feedparser.parse(NITTER_RSS)
     tweets = []
-
+    
     for entry in feed.entries[:10]:
-        if entry.title.startswith("RT by") or entry.title.startswith("R to"):
+        if entry.title.startswith(("RT by", "R to", "Pinned:")):
             continue
 
         tweet_id = entry.guid
-        text = entry.title
 
         soup = BeautifulSoup(entry.description, "html.parser")
+
+        # Ignore quoted tweets so only this tweet's own content is used
+        for quote in soup.find_all("blockquote"):
+            quote.decompose()
+
+        # Title is truncated on this site, so use the full text from the description
+        for br in soup.find_all("br"):
+            br.replace_with("\n")
+        first_p = soup.find("p")
+        text = first_p.get_text() if first_p else entry.title
+        text = text.replace("https://xitter.cf/t.co/", "https://t.co/").strip()
 
         images = []
         video_url = None
@@ -313,14 +323,44 @@ def upload_video_to_bsky(bsky, video_path):
         print(f"Video upload error: {e}")
         return None, 0, 0
         return None, 0, 0
+def split_text(text, limit=290):
+    """Split text into chunks of at most `limit` characters.
+    Breaks at line breaks first, then at spaces, so links are never cut."""
+    chunks = []
+    current = ""
 
+    for line in text.split("\n"):
+        # Break an over-long line into word-sized pieces
+        if len(line) > limit:
+            pieces, buf = [], ""
+            for word in line.split(" "):
+                candidate = f"{buf} {word}" if buf else word
+                if len(candidate) > limit and buf:
+                    pieces.append(buf)
+                    buf = word
+                else:
+                    buf = candidate
+            pieces.append(buf)
+        else:
+            pieces = [line]
+
+        for piece in pieces:
+            candidate = f"{current}\n{piece}" if current else piece
+            if len(candidate) > limit and current:
+                chunks.append(current.strip())
+                current = piece
+            else:
+                current = candidate
+
+    if current.strip():
+        chunks.append(current.strip())
+    return chunks
 
 def post_to_bluesky(text, images, video_url):
     try:
         bsky = Client()
         bsky.login(BLUESKY_HANDLE, BLUESKY_PASSWORD)
 
-        facets = parse_facets(text)
         embed = None
 
         if video_url:
@@ -345,7 +385,6 @@ def post_to_bluesky(text, images, video_url):
             for url in images[:4]:
                 try:
                     resp = requests.get(url, timeout=10)
-                    # Read dimensions from the image bytes before uploading
                     img_width, img_height = get_image_dimensions(resp.content)
                     blob = bsky.upload_blob(resp.content)
                     image_blobs.append((blob.blob, img_width, img_height))
@@ -366,23 +405,44 @@ def post_to_bluesky(text, images, video_url):
                     ]
                 )
 
-        print(f"Sending post with embed type: {type(embed).__name__ if embed else None}")
-        bsky.send_post(
-            text=text[:300],
-            facets=facets if facets else None,
-            embed=embed
-        )
+        # Split into thread parts if the text is longer than Bluesky allows
+        chunks = split_text(text) or [""]
+        root = None
+        parent = None
 
-        print("Posted:", text[:60])
+        for i, chunk in enumerate(chunks):
+            reply_to = None
+            if parent:
+                reply_to = models.AppBskyFeedPost.ReplyRef(parent=parent, root=root)
+
+            facets = parse_facets(chunk)
+            response = bsky.send_post(
+                text=chunk,
+                facets=facets if facets else None,
+                embed=embed if i == 0 else None,   # media only on the first post
+                reply_to=reply_to,
+            )
+
+            ref = models.create_strong_ref(response)
+            if root is None:
+                root = ref
+            parent = ref
+            print(f"Posted part {i + 1}/{len(chunks)}:", chunk[:60])
 
     except Exception as e:
         print(f"Bluesky error: {e}")
-
 
 def main():
     seen = load_seen()
     tweets = fetch_tweets()
 
+    if not seen:
+        for tw in tweets:
+            seen.add(tw["id"])
+        save_seen(seen)
+        print("First run: marked existing tweets as seen, nothing posted.")
+        return
+    
     for tw in reversed(tweets):
         if tw["id"] in seen:
             continue
