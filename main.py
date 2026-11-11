@@ -23,7 +23,8 @@ PINNED = "PINNED"              # marker: the reply sits under the pinned tweet
 # When seen_ids.json is empty, the bot would post every tweet in the feed at
 # once. With True (recommended) it only remembers them and posts nothing the
 # first time. Set to False if you WANT it to post the current backlog.
-SKIP_EXISTING_ON_FIRST_RUN = True
+SKIP_EXISTING_ON_FIRST_RUN = False
+FIRST_RUN_LIMIT = 10
 
 BSKY_MAX_DURATION = 600                 # 10 minutes in seconds
 BSKY_MAX_BYTES = 250 * 1024 * 1024      # a little under Bluesky's 300 MB cap

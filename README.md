@@ -1,7 +1,7 @@
 # Twitter → Bluesky Mirror Bot
 
-Automatically mirrors tweets to Bluesky, including images, clickable hashtags, and hyperlinks.
-
+Automatically mirrors tweets to Bluesky, including images, clickable hashtags, and hyperlinks. 
+ ⚠️ This project was vibe coded with the help of Claude by someone who can't code well. It works though!
 
 
 **Example Accounts**
