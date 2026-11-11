@@ -2,5 +2,7 @@ feedparser
 atproto
 requests
 beautifulsoup4
-pytesseract
 Pillow
+rapidocr
+onnxruntime
+ 

@@ -1,14 +1,19 @@
-import os
-import json
-import re
 import calendar
-import time
+import functools
+import io
+import json
+import os
+import re
 import subprocess
 import tempfile
-import requests
+import time
+from datetime import datetime
+
 import feedparser
-from bs4 import BeautifulSoup
+import requests
 from atproto import Client, models
+from bs4 import BeautifulSoup
+from PIL import Image
 
 # ---------------------------------------------------------------- settings --
 TWITTER_USER = "InfinityNikkiEN"
@@ -18,23 +23,17 @@ BLUESKY_HANDLE = os.environ["BLUESKY_HANDLE"]
 BLUESKY_PASSWORD = os.environ["BLUESKY_PASSWORD"]
 
 STATE_FILE = "seen_ids.json"
-MAX_THREADS_KEPT = 50          # how many past threads to remember for replies
-PINNED = "PINNED"              # marker: the reply sits under the pinned tweet
+MAX_THREADS_KEPT = 50        # how many past threads to remember (for replies)
+FIRST_RUN_LIMIT = 10         # on the very first run, only post this many newest tweets
+MAX_ATTEMPTS = 3             # give up on a tweet that fails this many runs in a row
+PINNED = "PINNED"            # marker: the reply sits under the pinned tweet
 
-# What to do the first time it runs (when seen_ids.json is empty):
-#   True  -> just remember the tweets that are already out there, post nothing
-#   False -> post the newest FIRST_RUN_LIMIT tweets (and their replies)
-SKIP_EXISTING_ON_FIRST_RUN = False
-FIRST_RUN_LIMIT = 10
-
-MAX_ATTEMPTS = 3               # give up on a tweet that fails to post this many runs in a row
-VIDEO_WAIT_SECONDS = 180       # how long to wait for Bluesky to finish processing a video
-OCR_ALT_TEXT = False            # read text inside images and use it as alt text
-OCR_LANGS = "eng"              # tesseract language code(s), e.g. "eng+chi_sim"
-
-BSKY_MAX_DURATION = 600                 # 10 minutes in seconds
-BSKY_MAX_BYTES = 100 * 1024 * 1024       # keep uploads small so they go through reliably
-BSKY_MAX_HEIGHT = 1080
+VIDEO_WAIT_SECONDS = 180     # how long to wait for Bluesky to process a video
+OCR_ALT_TEXT = True          # read text inside images (RapidOCR) and use it as alt text
+OCR_MIN_SCORE = 0.6          # ignore OCR lines it is less sure about (0 to 1)
+MAX_VIDEO_SECONDS = 600
+MAX_VIDEO_BYTES = 100 * 1024 * 1024
+MAX_VIDEO_HEIGHT = 1080
 
 
 # ------------------------------------------------------------------- state --
@@ -44,26 +43,21 @@ def load_state():
         with open(STATE_FILE) as f:
             data = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        data = []
-
+        data = {}
     if isinstance(data, list):          # old format: just a list of ids
-        return set(data), {}, {}
+        data = {"seen": data}
     return set(data.get("seen", [])), data.get("threads", {}), data.get("fails", {})
 
 
 def save_state(seen, threads, fails):
-    newest = sorted(
-        threads.items(), key=lambda kv: kv[1].get("time", 0), reverse=True
-    )[:MAX_THREADS_KEPT]
+    newest = sorted(threads.items(), key=lambda kv: kv[1].get("time", 0), reverse=True)
     fails = {k: v for k, v in fails.items() if k not in seen}
     with open(STATE_FILE, "w") as f:
-        json.dump(
-            {"seen": sorted(seen), "threads": dict(newest), "fails": fails},
-            f, indent=1,
-        )
+        json.dump({"seen": sorted(seen), "threads": dict(newest[:MAX_THREADS_KEPT]),
+                   "fails": fails}, f, indent=1)
 
 
-# ------------------------------------------------------------- text helpers --
+# ------------------------------------------------------------ text helpers --
 def clean_text(text):
     """Tidy tweet text: keep line breaks, drop blank lines and extra spaces."""
     text = text.replace("\xa0", " ").replace("\r", "")
@@ -72,166 +66,83 @@ def clean_text(text):
     return "\n".join(line for line in lines if line)
 
 
-def split_text(text, limit=290, min_fill=150):
-    """Split text into chunks of at most `limit` characters.
-    Fills each chunk as much as possible. Prefers to break at a line break
-    (if the chunk is already at least `min_fill` long), otherwise breaks
-    between words. Words and links are never cut."""
-    tokens = []
+def split_text(text, limit=290):
+    """Split text into chunks of at most `limit` characters, filling each chunk
+    as much as possible. Words and links are never cut."""
+    chunks, cur = [], ""
     for line in text.split("\n"):
-        first = True
-        for word in line.split():
-            if not tokens:
-                sep = ""
-            elif first:
-                sep = "\n"
-            else:
-                sep = " "
-            tokens.append((sep, word))
-            first = False
-
-    chunks = []
-    cur = ""
-    last_nl = -1  # position of the most recent line break inside cur
-
-    for sep, word in tokens:
-        piece = (sep if cur else "") + word
-        if cur and len(cur) + len(piece) > limit:
-            if last_nl >= min_fill:
-                chunks.append(cur[:last_nl].strip())
-                cur = cur[last_nl + 1:] + piece
-            else:
-                chunks.append(cur.strip())
+        for i, word in enumerate(line.split()):
+            sep = "" if not cur else ("\n" if i == 0 else " ")
+            if cur and len(cur) + len(sep) + len(word) > limit:
+                chunks.append(cur)
                 cur = word
-            last_nl = cur.rfind("\n")
-        else:
-            if cur and sep == "\n":
-                last_nl = len(cur)
-            cur += piece
-
-    if cur.strip():
-        chunks.append(cur.strip())
+            else:
+                cur += sep + word
+    if cur:
+        chunks.append(cur)
     return chunks
 
 
 def parse_facets(text):
+    """Make links and #hashtags clickable on Bluesky."""
     facets = []
-
-    for match in re.finditer(r'https?://[^\s]+', text):
-        url = match.group().rstrip('.,;:!?)]}"\'…')   # don't include trailing punctuation
-        start = len(text[:match.start()].encode("utf-8"))
-        end = start + len(url.encode("utf-8"))
+    for m in re.finditer(r"(https?://\S+)|#\w+", text):
+        if m.group(1):
+            url = m.group(1).rstrip(".,;:!?)]}\"'…")      # no trailing punctuation
+            end = m.start() + len(url)
+            feature = {"$type": "app.bsky.richtext.facet#link", "uri": url}
+        else:
+            end = m.end()
+            feature = {"$type": "app.bsky.richtext.facet#tag", "tag": m.group()[1:]}
         facets.append({
-            "index": {"byteStart": start, "byteEnd": end},
-            "features": [{"$type": "app.bsky.richtext.facet#link", "uri": url}]
+            "index": {"byteStart": len(text[:m.start()].encode()),
+                      "byteEnd": len(text[:end].encode())},
+            "features": [feature],
         })
-
-    for match in re.finditer(r'#\w+', text):
-        tag = match.group()[1:]
-        start = len(text[:match.start()].encode("utf-8"))
-        end = len(text[:match.end()].encode("utf-8"))
-        facets.append({
-            "index": {"byteStart": start, "byteEnd": end},
-            "features": [{"$type": "app.bsky.richtext.facet#tag", "tag": tag}]
-        })
-
     return facets
 
 
-# ------------------------------------------------------- thread matching ----
-def norm(text):
-    """Lowercase letters/digits only, so '♾ Foo | Bar' matches '♾️ Foo | Bar'."""
-    return re.sub(r'[\W_]+', '', text.lower())
+def describe(e):
+    """Readable error text (some errors have an empty message on their own)."""
+    resp = getattr(e, "response", None)
+    return f"{type(e).__name__}: {e!r}" + (f" | response: {resp}" if resp is not None else "")
 
 
-def first_line_key(text):
-    return norm(text.split("\n")[0]) if text else ""
-
-
-def find_parent_thread(threads, reply):
-    """FALLBACK guess, used only when the feed position doesn't tell us which
-    tweet a reply belongs to (e.g. the reply is the very first item in the feed).
-
-      1. prefer the thread whose first line matches the reply's text
-      2. otherwise use the most recent thread posted before the reply.
-    Returns the thread's id, or None if there is no earlier thread.
-    """
-    candidates = [
-        (tid, t) for tid, t in threads.items()
-        if t.get("time", 0) <= reply["time"]
-    ]
-    if not candidates:
-        return None
-    candidates.sort(key=lambda kv: kv[1].get("time", 0), reverse=True)
-
-    rkey = norm(reply["text"])
-    if len(rkey) >= 8:
-        for tid, t in candidates:
-            key = t.get("key", "")
-            if len(key) >= 8 and (
-                rkey == key or rkey.startswith(key) or key.startswith(rkey)
-            ):
-                return tid
-
-    return candidates[0][0]
-
-
-# ------------------------------------------------------------ media lookup --
-def fetch_video_from_xitter(tweet_path):
-    """Find the direct .mp4 link on the xitter.cf tweet page."""
-    page_url = "https://xitter.cf" + tweet_path
+# ------------------------------------------------------------- fetch tweets --
+def find_video(tweet_path):
+    """Find a direct .mp4 link for a tweet: xitter.cf page first, vxtwitter API as backup."""
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        print(f"Looking for video on {page_url}")
-        resp = requests.get(page_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-        links = re.findall(
-            r'''https://video\.twimg\.com/[^\s"'<>)]+\.mp4[^\s"'<>)]*''', resp.text
-        )
-        if not links:
-            print("No .mp4 link found on tweet page")
-            return None
-
-        def pixels(link):
-            m = re.search(r'/(\d+)x(\d+)/', link)
-            return int(m.group(1)) * int(m.group(2)) if m else 0
-
-        best = max(links, key=pixels).replace("&amp;", "&")
-        print(f"Found video: {best}")
-        return best
+        html = requests.get("https://xitter.cf" + tweet_path, headers=headers, timeout=15).text
+        links = re.findall(r'''https://video\.twimg\.com/[^\s"'<>)]+\.mp4[^\s"'<>)]*''', html)
+        if links:
+            def pixels(link):               # prefer the biggest resolution
+                m = re.search(r"/(\d+)x(\d+)/", link)
+                return int(m[1]) * int(m[2]) if m else 0
+            return max(links, key=pixels).replace("&amp;", "&")
     except Exception as e:
         print(f"xitter video lookup failed: {e}")
-        return None
-
-
-def fetch_video_from_vxtwitter(tweet_path):
-    """Fallback: ask the api.vxtwitter.com JSON API for the video URL."""
-    api_url = "https://api.vxtwitter.com" + tweet_path
     try:
-        print(f"Fetching media from vxtwitter API: {api_url}")
-        resp = requests.get(api_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        data = resp.json()
-
+        data = requests.get("https://api.vxtwitter.com" + tweet_path,
+                            headers=headers, timeout=10).json()
         for media in data.get("media_extended", []):
             if media.get("type") == "video" and media.get("url"):
                 return media["url"]
         for url in data.get("mediaURLs", []):
-            if url.endswith(".mp4") or "video" in url:
+            if url.endswith(".mp4"):
                 return url
     except Exception as e:
-        print(f"vxtwitter API fetch failed: {e}")
+        print(f"vxtwitter video lookup failed: {e}")
     return None
 
 
-# ---------------------------------------------------------- fetch tweets ----
 def fetch_tweets():
-    feed = feedparser.parse(FEED_URL)
     tweets = []
-
-    # In the feed, a tweet's own replies sit directly below it. So while we walk
-    # down the feed we remember the last "main" tweet, and any self-reply we
-    # meet belongs to that tweet.
+    # In the feed, a tweet's own replies sit directly below it, so a self-reply
+    # belongs to the last "main" tweet we passed.
     current_root = None
 
-    for entry in feed.entries[:20]:
+    for entry in feedparser.parse(FEED_URL).entries[:20]:
         title = entry.title.strip()
         low = title.lower()
 
@@ -239,82 +150,58 @@ def fetch_tweets():
             current_root = None
             continue
         if low.startswith("pinned:"):
-            current_root = PINNED      # we don't repost the pinned tweet or its replies
+            current_root = PINNED          # we don't repost the pinned tweet or its replies
             continue
 
         is_reply = low.startswith("r to ")
         if is_reply and not low.startswith(f"r to @{TWITTER_USER.lower()}"):
-            continue  # a reply to somebody else, not part of our own thread
+            continue                       # a reply to somebody else
 
         tweet_id = entry.guid
-        parent_id = None
-        if is_reply:
-            parent_id = current_root
-        else:
+        parent_id = current_root if is_reply else None
+        if not is_reply:
             current_root = tweet_id
         published = getattr(entry, "published_parsed", None)
-        tweet_time = calendar.timegm(published) if published else 0
 
         soup = BeautifulSoup(entry.description, "html.parser")
-
-        # Ignore quoted tweets so only this tweet's own content is used
-        for quote in soup.find_all("blockquote"):
+        for quote in soup.find_all("blockquote"):      # ignore quoted tweets
             quote.decompose()
-
-        # The title is truncated on this site, so use the full text instead
         for br in soup.find_all("br"):
             br.replace_with("\n")
+        # The title is truncated on this site, so use the full text instead
         first_p = soup.find("p")
-        if first_p:
-            text = first_p.get_text()
-        else:
-            text = re.sub(r"^R to @\w+:\s*", "", title)
-        text = clean_text(text)
+        text = first_p.get_text() if first_p else re.sub(r"^R to @\w+:\s*", "", title)
 
-        # Look for a video (the feed shows a thumbnail linking to the tweet)
+        # A video shows up as a thumbnail linking to the tweet
         video_url = None
-        tweet_path = None
-        has_video = False
-
         for a in soup.find_all("a", href=True):
-            if "/status/" in a["href"]:
+            img = a.find("img")
+            if "/status/" in a["href"] and img and "amplify_video_thumb" in img.get("src", ""):
                 href = a["href"].split("#")[0]
-                if href.startswith("http"):
-                    tweet_path = "/" + href.split("/", 3)[3]
-                else:
-                    tweet_path = href
-                img = a.find("img")
-                if img and "amplify_video_thumb" in img.get("src", ""):
-                    has_video = True
-                    break
-
-        if has_video and tweet_path:
-            video_url = (
-                fetch_video_from_xitter(tweet_path)
-                or fetch_video_from_vxtwitter(tweet_path)
-            )
-            print(f"Video detected → {video_url}")
+                path = "/" + href.split("/", 3)[3] if href.startswith("http") else href
+                video_url = find_video(path)
+                print(f"Video detected → {video_url}")
+                break
 
         # Images (skip video thumbnails, which sit inside a link to the tweet)
         images = []
         for img in soup.find_all("img"):
-            parent = img.find_parent("a")
-            if parent and "/status/" in parent.get("href", ""):
+            link = img.find_parent("a")
+            if link and "/status/" in link.get("href", ""):
                 continue
-            src = img.get("src", "")
-            src = src.replace("https://nitter.net/pic/", "https://pbs.twimg.com/")
+            src = img.get("src", "").replace("https://nitter.net/pic/", "https://pbs.twimg.com/")
             src = requests.utils.unquote(src)
             if src and src not in images:
                 images.append(src)
 
         tweets.append({
             "id": tweet_id,
-            "text": text,
+            "text": clean_text(text),
             "images": images,
             "video_url": video_url,
             "is_reply": is_reply,
             "parent_id": parent_id,
-            "time": tweet_time,
+            "time": calendar.timegm(published) if published else 0,
         })
 
     print(f"Fetched {len(tweets)} tweets")
@@ -325,32 +212,24 @@ def fetch_tweets():
 def probe_video(path):
     """Return (width, height, duration_seconds) for a local file or URL."""
     try:
-        result = subprocess.run([
-            "ffprobe", "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height",
-            "-show_entries", "format=duration",
-            "-of", "json",
-            path
-        ], capture_output=True, timeout=30)
-        info = json.loads(result.stdout)
-        streams = info.get("streams", [{}])
-        fmt = info.get("format", {})
-        width = int(streams[0].get("width", 0)) if streams else 0
-        height = int(streams[0].get("height", 0)) if streams else 0
-        duration = float(fmt.get("duration", 0))
-        return width, height, duration
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-show_entries", "format=duration",
+             "-of", "json", path],
+            capture_output=True, timeout=30).stdout
+        info = json.loads(out)
+        stream = (info.get("streams") or [{}])[0]
+        return (int(stream.get("width", 0)), int(stream.get("height", 0)),
+                float(info.get("format", {}).get("duration", 0)))
     except Exception as e:
         print(f"ffprobe failed: {e}")
         return 0, 0, 0
 
 
 def download_video(url):
-    """
-    Download and transcode a video to a Bluesky-compatible MP4 (libx264/aac),
-    enforcing the length/size/resolution limits.
-    Returns the path to a ready-to-upload .mp4, or None on failure.
-    """
+    """Download a video and convert it to a Bluesky-friendly mp4 (h264/aac),
+    within the length, size and resolution limits. Returns a file path or None."""
+    out = None
     try:
         out = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
         out.close()
@@ -358,92 +237,53 @@ def download_video(url):
         width, height, duration = probe_video(url)
         print(f"Source video: {width}x{height}, {duration:.1f}s")
 
-        # "1080p" means the SHORT side is at most 1080.
-        short_side = min(width, height) if width and height else 0
-        is_vertical = height > width
-
-        if short_side > BSKY_MAX_HEIGHT:
-            if is_vertical:
-                scale_filter = f"scale={BSKY_MAX_HEIGHT}:-2"
-                print(f"Vertical video — downscaling width to {BSKY_MAX_HEIGHT}px")
-            else:
-                scale_filter = f"scale=-2:{BSKY_MAX_HEIGHT}"
-                print(f"Horizontal video — downscaling height to {BSKY_MAX_HEIGHT}px")
+        # Only the SHORT side is limited to 1080
+        if width and height and min(width, height) > MAX_VIDEO_HEIGHT:
+            scale = (f"scale={MAX_VIDEO_HEIGHT}:-2" if height > width
+                     else f"scale=-2:{MAX_VIDEO_HEIGHT}")
         else:
-            scale_filter = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+            scale = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
 
-        trim_duration = min(duration, BSKY_MAX_DURATION) if duration > 0 else BSKY_MAX_DURATION
-        safe_video_kbps = max(500, int((BSKY_MAX_BYTES * 8 / trim_duration) / 1000) - 128)
+        length = min(duration, MAX_VIDEO_SECONDS) if duration > 0 else MAX_VIDEO_SECONDS
+        kbps = max(500, int(MAX_VIDEO_BYTES * 8 / length / 1000) - 128)
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-            "-i", url,
-            "-t", str(trim_duration),
-            "-vf", scale_filter,
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "23",
-            "-maxrate", f"{safe_video_kbps}k",
-            "-bufsize", f"{safe_video_kbps * 2}k",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-movflags", "+faststart",
-            out.name
-        ]
+        result = subprocess.run([
+            "ffmpeg", "-y", "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+            "-i", url, "-t", str(length), "-vf", scale,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-maxrate", f"{kbps}k", "-bufsize", f"{kbps * 2}k",
+            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out.name,
+        ], capture_output=True, timeout=1500)
 
-        result = subprocess.run(cmd, capture_output=True, timeout=1500)
-        if result.returncode == 0:
+        if result.returncode != 0:
+            print(f"ffmpeg error: {result.stderr.decode()}")
+        else:
             size = os.path.getsize(out.name)
             print(f"Downloaded and encoded: {size / 1024 / 1024:.1f} MB")
-            return out.name
-        else:
-            print(f"ffmpeg error: {result.stderr.decode()}")
-            os.unlink(out.name)
-            return None
-
+            if size <= MAX_VIDEO_BYTES:
+                return out.name
+            print("Video is over the size limit, skipping it")
     except Exception as e:
-        print(f"Download failed: {e}")
-        return None
+        print(f"Video download failed: {e}")
+    if out and os.path.exists(out.name):
+        os.unlink(out.name)
+    return None
 
 
-def get_image_dimensions(data):
-    """Read (width, height) from raw PNG/JPEG bytes. Returns (0, 0) if unknown."""
-    try:
-        import struct
-        if data[:8] == b'\x89PNG\r\n\x1a\n':
-            w, h = struct.unpack('>II', data[16:24])
-            return w, h
-
-        if data[:2] == b'\xff\xd8':
-            i = 2
-            while i < len(data) - 8:
-                if data[i] != 0xff:
-                    break
-                marker = data[i + 1]
-                if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
-                              0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
-                    h, w = struct.unpack('>HH', data[i + 5:i + 9])
-                    return w, h
-                seg_len = struct.unpack('>H', data[i + 2:i + 4])[0]
-                i += 2 + seg_len
-    except Exception:
-        pass
-    return 0, 0
+# ----------------------------------------------------------------- bluesky --
+@functools.cache
+def get_client():
+    """Log in once per run and reuse the connection."""
+    client = Client()
+    client.login(BLUESKY_HANDLE, BLUESKY_PASSWORD)
+    return client
 
 
-def describe(e):
-    """Readable error text (some errors have an empty message on their own)."""
-    resp = getattr(e, "response", None)
-    extra = f" | response: {resp}" if resp is not None else ""
-    return f"{type(e).__name__}: {e!r}{extra}"
-
-
-def upload_blob_with_retry(bsky, data, tries=3):
+def upload_blob(bsky, data, tries=3):
     """Upload a file to Bluesky, trying again if the connection hiccups."""
     for attempt in range(1, tries + 1):
         try:
-            return bsky.upload_blob(data)
+            return bsky.upload_blob(data).blob
         except Exception as e:
             print(f"Upload attempt {attempt}/{tries} failed: {describe(e)}")
             if attempt == tries:
@@ -451,295 +291,272 @@ def upload_blob_with_retry(bsky, data, tries=3):
             time.sleep(5 * attempt)
 
 
-def upload_video_to_bsky(bsky, video_path):
-    """Upload a video blob. Returns (blob, width, height) or (None, 0, 0)."""
+def image_size(data):
     try:
-        width, height, _ = probe_video(video_path)
-        with open(video_path, "rb") as f:
-            video_data = f.read()
-        upload = upload_blob_with_retry(bsky, video_data)
-        print(f"Uploaded video ({len(video_data) / 1024 / 1024:.1f} MB)")
-        return upload.blob, width, height
-    except Exception as e:
-        print(f"Video upload error: {describe(e)}")
-        return None, 0, 0
+        return Image.open(io.BytesIO(data)).size
+    except Exception:
+        return 0, 0
 
 
-# --------------------------------------------------------------- alt text ----
-def looks_like_text(line):
-    """Filter out OCR noise: keep lines that contain at least one real word."""
-    if not line:
-        return False
-    ok_chars = sum(c.isalnum() or c.isspace() or c in "-:|>&!?.,'\"" for c in line)
-    if ok_chars < 0.7 * len(line):
-        return False
-    for word in line.split():
-        letters = sum(c.isalpha() for c in word)
-        if letters >= 3 and letters >= 0.7 * len(word):
-            return True
-    return False
+@functools.cache
+def get_ocr():
+    from rapidocr import RapidOCR      # only loaded when OCR is on; downloads its models on first use
+    return RapidOCR()
 
 
-def ocr_alt_text(image_bytes):
+def ocr_alt_text(data):
     """Read any text in the image and return it as alt text ('' if none found)."""
     if not OCR_ALT_TEXT:
         return ""
     try:
-        import io
-        import pytesseract
-        from PIL import Image
-        img = Image.open(io.BytesIO(image_bytes))
-        raw = pytesseract.image_to_string(img, lang=OCR_LANGS)
+        import numpy as np
+        img = np.array(Image.open(io.BytesIO(data)).convert("RGB"))[:, :, ::-1]   # RGB -> BGR
+        result = get_ocr()(img)
+        lines = [t.strip() for t, score in zip(result.txts or (), result.scores or ())
+                 if score >= OCR_MIN_SCORE and t.strip()]
     except Exception as e:
         print(f"OCR skipped: {describe(e)}")
         return ""
-
-    lines = []
-    for line in raw.splitlines():
-        line = " ".join(line.split())
-        if looks_like_text(line):
-            lines.append(line)
     if not lines:
         return ""
-
-    alt = "Text in image: " + " ".join(lines)
-    return alt[:1000]
-
-
-# ----------------------------------------------------------------- bluesky --
-_client = None
-
-
-def get_client():
-    """Log in once per run and reuse the connection."""
-    global _client
-    if _client is None:
-        client = Client()
-        client.login(BLUESKY_HANDLE, BLUESKY_PASSWORD)
-        _client = client
-    return _client
-
-
-def wait_for_video(bsky, post_uri):
-    """After posting a video, wait until Bluesky has finished processing it,
-    so the next post doesn't go out while this one still shows 'processing'."""
-    deadline = time.time() + VIDEO_WAIT_SECONDS
-    while time.time() < deadline:
-        try:
-            posts = bsky.get_posts([post_uri]).posts
-            embed = posts[0].embed if posts else None
-            playlist = getattr(embed, "playlist", None)
-            if playlist:
-                r = requests.get(playlist, timeout=10)
-                if r.status_code == 200 and "#EXTM3U" in r.text:
-                    print("Video is ready")
-                    return True
-        except Exception as e:
-            print(f"Checking video status: {describe(e)}")
-        time.sleep(5)
-    print("Gave up waiting for the video to finish processing, continuing")
-    return False
+    print(f"Alt text: {' '.join(lines)[:80]}")
+    return ("Text in image: " + " ".join(lines))[:1000]
 
 
 def build_embed(bsky, images, video_url):
     """Upload the media and return an embed for the first post (or None)."""
     if video_url:
-        video_path = download_video(video_url)
-        if not video_path:
-            print("Video download failed")
+        path = download_video(video_url)
+        if not path:
             return None
-        blob, width, height = upload_video_to_bsky(bsky, video_path)
-        os.unlink(video_path)
-        if not blob:
-            print("Video upload to Bluesky failed")
+        try:
+            width, height, _ = probe_video(path)
+            with open(path, "rb") as f:
+                blob = upload_blob(bsky, f.read())
+        except Exception as e:
+            print(f"Video upload failed: {describe(e)}")
             return None
-        kwargs = {"video": blob}
-        if width and height:
-            kwargs["aspect_ratio"] = models.AppBskyEmbedDefs.AspectRatio(
-                width=width, height=height
-            )
-        return models.AppBskyEmbedVideo.Main(**kwargs)
+        finally:
+            os.unlink(path)
+        ratio = (models.AppBskyEmbedDefs.AspectRatio(width=width, height=height)
+                 if width and height else None)
+        return models.AppBskyEmbedVideo.Main(video=blob, aspect_ratio=ratio)
 
-    if images:
-        image_blobs = []
-        for url in images[:4]:
-            try:
-                resp = requests.get(url, timeout=10)
-                img_width, img_height = get_image_dimensions(resp.content)
-                alt = ocr_alt_text(resp.content)
-                if alt:
-                    print(f"Alt text: {alt[:80]}")
-                blob = upload_blob_with_retry(bsky, resp.content)
-                image_blobs.append((blob.blob, img_width, img_height, alt))
-            except Exception as e:
-                print(f"Image upload failed: {describe(e)}")
+    uploaded = []
+    for url in images[:4]:
+        try:
+            data = requests.get(url, timeout=10).content
+            width, height = image_size(data)
+            uploaded.append(models.AppBskyEmbedImages.Image(
+                image=upload_blob(bsky, data), alt=ocr_alt_text(data),
+                aspect_ratio=(models.AppBskyEmbedDefs.AspectRatio(width=width, height=height)
+                              if width and height else None),
+            ))
+        except Exception as e:
+            print(f"Image upload failed: {describe(e)}")
+    return models.AppBskyEmbedImages.Main(images=uploaded) if uploaded else None
 
-        if image_blobs:
-            return models.AppBskyEmbedImages.Main(
-                images=[
-                    models.AppBskyEmbedImages.Image(
-                        image=blob,
-                        alt=alt,
-                        aspect_ratio=models.AppBskyEmbedDefs.AspectRatio(
-                            width=w, height=h
-                        ) if w and h else None,
-                    )
-                    for blob, w, h, alt in image_blobs
-                ]
-            )
-    return None
+
+def wait_for_video(bsky, post_uri):
+    """Wait until Bluesky has finished processing the video, so the next post
+    doesn't go out while this one still shows 'processing'."""
+    deadline = time.time() + VIDEO_WAIT_SECONDS
+    while time.time() < deadline:
+        try:
+            posts = bsky.get_posts([post_uri]).posts
+            playlist = getattr(posts[0].embed, "playlist", None) if posts else None
+            if playlist:
+                r = requests.get(playlist, timeout=10)
+                if r.status_code == 200 and "#EXTM3U" in r.text:
+                    print("Video is ready")
+                    return
+        except Exception as e:
+            print(f"Checking video status: {describe(e)}")
+        time.sleep(5)
+    print("Gave up waiting for the video to finish processing, continuing")
+
+
+# ------------------------------------------------- avoiding double posts ----
+def recent_posts(limit=100):
+    """Our own latest posts and replies (not reposts), newest first, as plain
+    dicts. Returns None if the feed can't be read."""
+    try:
+        feed = get_client().get_author_feed(
+            actor=BLUESKY_HANDLE, limit=limit, filter="posts_with_replies").feed
+    except Exception as e:
+        print(f"Could not read our own Bluesky feed: {describe(e)}")
+        return None
+
+    posts = []
+    for item in feed:
+        if getattr(item, "reason", None):           # a repost of someone else's post
+            continue
+        rec = item.post.record
+        reply = getattr(rec, "reply", None)
+        try:
+            created = datetime.fromisoformat(rec.created_at.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            created = 0
+        posts.append({
+            "uri": item.post.uri, "cid": item.post.cid,
+            "text": getattr(rec, "text", "") or "",
+            "parent": getattr(getattr(reply, "parent", None), "uri", None) if reply else None,
+            "created": created,
+        })
+    return posts
+
+
+def find_posted(posts, text, parent_uri=None, not_before=0):
+    """Is this tweet already on Bluesky? Looks for a post with the same text under
+    `parent_uri` (None = top level), made at/after `not_before` so an old tweet with
+    the same wording isn't mistaken for it. Returns {"first": post, "last": post} or None."""
+    chunks = split_text(text)
+    first = next((p for p in posts or []
+                  if p["text"] == chunks[0] and p["parent"] == parent_uri
+                  and p["created"] >= not_before), None) if chunks else None
+    if not first:
+        return None
+    last = first
+    for chunk in chunks[1:]:                       # follow the rest of a long thread
+        nxt = next((p for p in posts if p["parent"] == last["uri"] and p["text"] == chunk), None)
+        if not nxt:
+            break
+        last = nxt
+    return {"first": first, "last": last}
+
+
+def ref(d):
+    return models.ComAtprotoRepoStrongRef.Main(uri=d["uri"], cid=d["cid"])
 
 
 def post_to_bluesky(text, images, video_url, thread=None):
-    """
-    Post `text` (split into a thread if it is long). Media goes on the first
-    post. If `thread` is given ({"root": ref, "last": ref}), the new posts are
-    added to the end of that existing thread.
-
-    Returns {"root": ref, "last": ref} describing what was posted, or None if
-    nothing could be posted.
-    """
+    """Post `text` (split into a thread if long); media goes on the first post.
+    If `thread` ({"root": ..., "last": ...}) is given, the posts are added to
+    the end of it. Returns {"root": ..., "last": ...} or None if nothing posted."""
     root = parent = None
     posted = 0
+    chunks = split_text(text) or [""]
 
     try:
         bsky = get_client()
         embed = build_embed(bsky, images, video_url)
-
         if thread:
-            root = models.ComAtprotoRepoStrongRef.Main(
-                uri=thread["root"]["uri"], cid=thread["root"]["cid"]
-            )
-            parent = models.ComAtprotoRepoStrongRef.Main(
-                uri=thread["last"]["uri"], cid=thread["last"]["cid"]
-            )
+            root, parent = ref(thread["root"]), ref(thread["last"])
 
-        chunks = split_text(text) or [""]
         for i, chunk in enumerate(chunks):
-            reply_to = None
-            if parent:
-                reply_to = models.AppBskyFeedPost.ReplyRef(parent=parent, root=root)
-
-            facets = parse_facets(chunk)
-            post_args = dict(text=chunk, facets=facets if facets else None, reply_to=reply_to)
-            used_embed = embed if i == 0 else None   # media only goes on the first post
+            args = dict(
+                text=chunk, facets=parse_facets(chunk) or None,
+                reply_to=models.AppBskyFeedPost.ReplyRef(parent=parent, root=root) if parent else None,
+            )
+            use_embed = embed if i == 0 else None
             try:
-                response = bsky.send_post(embed=used_embed, **post_args)
+                new = models.create_strong_ref(bsky.send_post(embed=use_embed, **args))
             except Exception as e:
-                if used_embed is not None:
-                    print(f"Post with media failed ({describe(e)}); retrying without media")
-                    used_embed = None
-                    response = bsky.send_post(embed=None, **post_args)
-                else:
+                if not use_embed:
                     raise
+                print(f"Post with media failed ({describe(e)}); checking, then trying without media")
+                use_embed = None
+                # it may have gone through anyway (e.g. a timeout) - don't post it twice
+                hit = find_posted(recent_posts(20), chunk, parent.uri if parent else None,
+                                  time.time() - 600)
+                new = ref(hit["first"]) if hit else models.create_strong_ref(
+                    bsky.send_post(**args))
 
-            ref = models.create_strong_ref(response)
-            if root is None:
-                root = ref
-            parent = ref
+            root = root or new
+            parent = new
             posted += 1
-
-            # Don't send the next post until the video has finished processing
-            if used_embed is not None and video_url:
-                wait_for_video(bsky, response.uri)
+            if use_embed and video_url:
+                wait_for_video(bsky, new.uri)
             print(f"Posted part {i + 1}/{len(chunks)}:", chunk[:60])
-
     except Exception as e:
         print(f"Bluesky error: {describe(e)}")
+        if posted:
+            print(f"WARNING: only {posted} of {len(chunks)} parts were posted; the rest was dropped")
 
     if not posted:
         return None
-    return {
-        "root": {"uri": root.uri, "cid": root.cid},
-        "last": {"uri": parent.uri, "cid": parent.cid},
-    }
+    return {"root": {"uri": root.uri, "cid": root.cid},
+            "last": {"uri": parent.uri, "cid": parent.cid}}
 
 
 # -------------------------------------------------------------------- main --
+def latest_thread(threads, before):
+    """Fallback guess for a reply whose tweet the feed doesn't tell us:
+    the newest thread posted before it."""
+    older = [(t.get("time", 0), tid) for tid, t in threads.items() if t.get("time", 0) <= before]
+    return max(older)[1] if older else None
+
+
 def main():
     seen, threads, fails = load_state()
     tweets = fetch_tweets()
-
-    if not seen and not threads and SKIP_EXISTING_ON_FIRST_RUN:
-        for tw in tweets:
-            seen.add(tw["id"])
-        save_state(seen, threads, fails)
-        print("First run: marked existing tweets as seen, nothing posted.")
-        return
 
     if not seen and not threads:
         # First run: only post the newest FIRST_RUN_LIMIT tweets, plus their replies
         roots = sorted((t for t in tweets if not t["is_reply"]),
                        key=lambda t: t["time"], reverse=True)
         keep = {t["id"] for t in roots[:FIRST_RUN_LIMIT]}
-        for t in tweets:
-            owner = t["parent_id"] if t["is_reply"] else t["id"]
-            if owner not in keep:
-                seen.add(t["id"])
+        seen |= {t["id"] for t in tweets
+                 if (t["parent_id"] if t["is_reply"] else t["id"]) not in keep}
 
-    # Oldest first, so a tweet is always posted before its replies
-    pending = [t for t in tweets if t["id"] not in seen]
-    pending.sort(key=lambda t: t["time"])
+    posts = None                      # our recent Bluesky posts, loaded once when needed
+    pending = sorted((t for t in tweets if t["id"] not in seen), key=lambda t: t["time"])
 
-    for tw in pending:
-        if not tw["text"] and not tw["images"] and not tw["video_url"]:
+    for tw in pending:                # oldest first, so a tweet goes out before its replies
+        label = tw["text"][:60]
+        if not (tw["text"] or tw["images"] or tw["video_url"]):
             seen.add(tw["id"])
             continue
 
+        thread = None
         if tw["is_reply"]:
-            parent_id = tw["parent_id"]
-
-            if parent_id == PINNED:
-                print("Reply to the pinned tweet, skipping:", tw["text"][:60])
+            pid = tw["parent_id"] or latest_thread(threads, tw["time"])
+            if pid in (None, PINNED):
+                print("Reply has no thread to attach to (or is under the pinned tweet), skipping:", label)
                 seen.add(tw["id"])
                 continue
-
-            if parent_id is None:               # position unknown: make a best guess
-                parent_id = find_parent_thread(threads, tw)
-                if parent_id is None:
-                    print("Reply has no earlier thread to attach to, skipping:", tw["text"][:60])
+            if pid not in threads:
+                if pid in seen:
+                    print("Reply's tweet was not reposted, skipping:", label)
                     seen.add(tw["id"])
-                    continue
-            elif parent_id not in threads:
-                if parent_id in seen:           # its tweet was never mirrored by us
-                    print("Reply's tweet was not reposted, skipping:", tw["text"][:60])
-                    seen.add(tw["id"])
-                else:                           # its tweet hasn't gone out yet: retry next run
+                else:
                     print("Waiting for the original tweet before posting this reply")
                 continue
+            thread = threads[pid]
 
-            print(f"Adding reply to the end of thread {parent_id}:", tw["text"][:60])
-            thread = threads[parent_id]
-            result = post_to_bluesky(
-                tw["text"], tw["images"], tw["video_url"],
-                thread={"root": thread["root"], "last": thread["last"]},
-            )
-            if result:
-                thread["last"] = result["last"]
+        # Make sure it isn't already on Bluesky (lost state file, overlapping runs, crash)
+        hit = None
+        if tw["text"]:
+            if posts is None:
+                posts = recent_posts() or []
+            hit = find_posted(posts, tw["text"], thread["last"]["uri"] if thread else None,
+                              tw["time"] - 60)
+
+        if hit:
+            print("Already on Bluesky, not posting again:", label)
+            result = {
+                "root": thread["root"] if thread else {"uri": hit["first"]["uri"], "cid": hit["first"]["cid"]},
+                "last": {"uri": hit["last"]["uri"], "cid": hit["last"]["cid"]},
+            }
         else:
-            print("Reposting:", tw["text"][:80])
-            result = post_to_bluesky(tw["text"], tw["images"], tw["video_url"])
-            if result:
-                threads[tw["id"]] = {
-                    "root": result["root"],
-                    "last": result["last"],
-                    "key": first_line_key(tw["text"]),
-                    "time": tw["time"],
-                }
+            print("Posting reply:" if thread else "Reposting:", label)
+            result = post_to_bluesky(tw["text"], tw["images"], tw["video_url"], thread)
 
         if result:
+            if thread:
+                thread["last"] = result["last"]
+            else:
+                threads[tw["id"]] = {**result, "time": tw["time"]}
             seen.add(tw["id"])
         else:
-            n = fails.get(tw["id"], 0) + 1
-            fails[tw["id"]] = n
-            if n >= MAX_ATTEMPTS:
-                print(f"Giving up on this tweet after {n} runs: {tw['text'][:60]}")
-                seen.add(tw["id"])
-            else:
+            fails[tw["id"]] = fails.get(tw["id"], 0) + 1
+            if fails[tw["id"]] < MAX_ATTEMPTS:
                 # Stop here so newer tweets don't get posted ahead of this one
                 print("Could not post this tweet. Stopping so the order stays correct; will retry next run.")
                 save_state(seen, threads, fails)
                 return
+            print(f"Giving up on this tweet after {fails[tw['id']]} runs: {label}")
+            seen.add(tw["id"])
 
         save_state(seen, threads, fails)   # save as we go, in case a later one crashes
 
