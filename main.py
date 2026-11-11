@@ -2,6 +2,7 @@ import os
 import json
 import re
 import calendar
+import time
 import subprocess
 import tempfile
 import requests
@@ -20,20 +21,25 @@ STATE_FILE = "seen_ids.json"
 MAX_THREADS_KEPT = 50          # how many past threads to remember for replies
 PINNED = "PINNED"              # marker: the reply sits under the pinned tweet
 
-# When seen_ids.json is empty, the bot would post every tweet in the feed at
-# once. With True (recommended) it only remembers them and posts nothing the
-# first time. Set to False if you WANT it to post the current backlog.
+# What to do the first time it runs (when seen_ids.json is empty):
+#   True  -> just remember the tweets that are already out there, post nothing
+#   False -> post the newest FIRST_RUN_LIMIT tweets (and their replies)
 SKIP_EXISTING_ON_FIRST_RUN = False
 FIRST_RUN_LIMIT = 10
 
+MAX_ATTEMPTS = 3               # give up on a tweet that fails to post this many runs in a row
+VIDEO_WAIT_SECONDS = 180       # how long to wait for Bluesky to finish processing a video
+OCR_ALT_TEXT = True            # read text inside images and use it as alt text
+OCR_LANGS = "eng"              # tesseract language code(s), e.g. "eng+chi_sim"
+
 BSKY_MAX_DURATION = 600                 # 10 minutes in seconds
-BSKY_MAX_BYTES = 250 * 1024 * 1024      # a little under Bluesky's 300 MB cap
+BSKY_MAX_BYTES = 50 * 1024 * 1024       # keep uploads small so they go through reliably
 BSKY_MAX_HEIGHT = 1080
 
 
 # ------------------------------------------------------------------- state --
 def load_state():
-    """Return (set of seen tweet ids, dict of threads we've posted)."""
+    """Return (set of seen tweet ids, dict of threads we've posted, fail counts)."""
     try:
         with open(STATE_FILE) as f:
             data = json.load(f)
@@ -41,16 +47,20 @@ def load_state():
         data = []
 
     if isinstance(data, list):          # old format: just a list of ids
-        return set(data), {}
-    return set(data.get("seen", [])), data.get("threads", {})
+        return set(data), {}, {}
+    return set(data.get("seen", [])), data.get("threads", {}), data.get("fails", {})
 
 
-def save_state(seen, threads):
+def save_state(seen, threads, fails):
     newest = sorted(
         threads.items(), key=lambda kv: kv[1].get("time", 0), reverse=True
     )[:MAX_THREADS_KEPT]
+    fails = {k: v for k, v in fails.items() if k not in seen}
     with open(STATE_FILE, "w") as f:
-        json.dump({"seen": sorted(seen), "threads": dict(newest)}, f, indent=1)
+        json.dump(
+            {"seen": sorted(seen), "threads": dict(newest), "fails": fails},
+            f, indent=1,
+        )
 
 
 # ------------------------------------------------------------- text helpers --
@@ -422,18 +432,78 @@ def get_image_dimensions(data):
     return 0, 0
 
 
+def describe(e):
+    """Readable error text (some errors have an empty message on their own)."""
+    resp = getattr(e, "response", None)
+    extra = f" | response: {resp}" if resp is not None else ""
+    return f"{type(e).__name__}: {e!r}{extra}"
+
+
+def upload_blob_with_retry(bsky, data, tries=3):
+    """Upload a file to Bluesky, trying again if the connection hiccups."""
+    for attempt in range(1, tries + 1):
+        try:
+            return bsky.upload_blob(data)
+        except Exception as e:
+            print(f"Upload attempt {attempt}/{tries} failed: {describe(e)}")
+            if attempt == tries:
+                raise
+            time.sleep(5 * attempt)
+
+
 def upload_video_to_bsky(bsky, video_path):
     """Upload a video blob. Returns (blob, width, height) or (None, 0, 0)."""
     try:
         width, height, _ = probe_video(video_path)
         with open(video_path, "rb") as f:
             video_data = f.read()
-        upload = bsky.upload_blob(video_data)
+        upload = upload_blob_with_retry(bsky, video_data)
         print(f"Uploaded video ({len(video_data) / 1024 / 1024:.1f} MB)")
         return upload.blob, width, height
     except Exception as e:
-        print(f"Video upload error: {e}")
+        print(f"Video upload error: {describe(e)}")
         return None, 0, 0
+
+
+# --------------------------------------------------------------- alt text ----
+def looks_like_text(line):
+    """Filter out OCR noise: keep lines that contain at least one real word."""
+    if not line:
+        return False
+    ok_chars = sum(c.isalnum() or c.isspace() or c in "-:|>&!?.,'\"" for c in line)
+    if ok_chars < 0.7 * len(line):
+        return False
+    for word in line.split():
+        letters = sum(c.isalpha() for c in word)
+        if letters >= 3 and letters >= 0.7 * len(word):
+            return True
+    return False
+
+
+def ocr_alt_text(image_bytes):
+    """Read any text in the image and return it as alt text ('' if none found)."""
+    if not OCR_ALT_TEXT:
+        return ""
+    try:
+        import io
+        import pytesseract
+        from PIL import Image
+        img = Image.open(io.BytesIO(image_bytes))
+        raw = pytesseract.image_to_string(img, lang=OCR_LANGS)
+    except Exception as e:
+        print(f"OCR skipped: {describe(e)}")
+        return ""
+
+    lines = []
+    for line in raw.splitlines():
+        line = " ".join(line.split())
+        if looks_like_text(line):
+            lines.append(line)
+    if not lines:
+        return ""
+
+    alt = "Text in image: " + " ".join(lines)
+    return alt[:1000]
 
 
 # ----------------------------------------------------------------- bluesky --
@@ -448,6 +518,27 @@ def get_client():
         client.login(BLUESKY_HANDLE, BLUESKY_PASSWORD)
         _client = client
     return _client
+
+
+def wait_for_video(bsky, post_uri):
+    """After posting a video, wait until Bluesky has finished processing it,
+    so the next post doesn't go out while this one still shows 'processing'."""
+    deadline = time.time() + VIDEO_WAIT_SECONDS
+    while time.time() < deadline:
+        try:
+            posts = bsky.get_posts([post_uri]).posts
+            embed = posts[0].embed if posts else None
+            playlist = getattr(embed, "playlist", None)
+            if playlist:
+                r = requests.get(playlist, timeout=10)
+                if r.status_code == 200 and "#EXTM3U" in r.text:
+                    print("Video is ready")
+                    return True
+        except Exception as e:
+            print(f"Checking video status: {describe(e)}")
+        time.sleep(5)
+    print("Gave up waiting for the video to finish processing, continuing")
+    return False
 
 
 def build_embed(bsky, images, video_url):
@@ -475,22 +566,25 @@ def build_embed(bsky, images, video_url):
             try:
                 resp = requests.get(url, timeout=10)
                 img_width, img_height = get_image_dimensions(resp.content)
-                blob = bsky.upload_blob(resp.content)
-                image_blobs.append((blob.blob, img_width, img_height))
+                alt = ocr_alt_text(resp.content)
+                if alt:
+                    print(f"Alt text: {alt[:80]}")
+                blob = upload_blob_with_retry(bsky, resp.content)
+                image_blobs.append((blob.blob, img_width, img_height, alt))
             except Exception as e:
-                print(f"Image upload failed: {e}")
+                print(f"Image upload failed: {describe(e)}")
 
         if image_blobs:
             return models.AppBskyEmbedImages.Main(
                 images=[
                     models.AppBskyEmbedImages.Image(
                         image=blob,
-                        alt="",
+                        alt=alt,
                         aspect_ratio=models.AppBskyEmbedDefs.AspectRatio(
                             width=w, height=h
                         ) if w and h else None,
                     )
-                    for blob, w, h in image_blobs
+                    for blob, w, h, alt in image_blobs
                 ]
             )
     return None
@@ -527,22 +621,31 @@ def post_to_bluesky(text, images, video_url, thread=None):
                 reply_to = models.AppBskyFeedPost.ReplyRef(parent=parent, root=root)
 
             facets = parse_facets(chunk)
-            response = bsky.send_post(
-                text=chunk,
-                facets=facets if facets else None,
-                embed=embed if i == 0 else None,   # media only on the first post
-                reply_to=reply_to,
-            )
+            post_args = dict(text=chunk, facets=facets if facets else None, reply_to=reply_to)
+            used_embed = embed if i == 0 else None   # media only goes on the first post
+            try:
+                response = bsky.send_post(embed=used_embed, **post_args)
+            except Exception as e:
+                if used_embed is not None:
+                    print(f"Post with media failed ({describe(e)}); retrying without media")
+                    used_embed = None
+                    response = bsky.send_post(embed=None, **post_args)
+                else:
+                    raise
 
             ref = models.create_strong_ref(response)
             if root is None:
                 root = ref
             parent = ref
             posted += 1
+
+            # Don't send the next post until the video has finished processing
+            if used_embed is not None and video_url:
+                wait_for_video(bsky, response.uri)
             print(f"Posted part {i + 1}/{len(chunks)}:", chunk[:60])
 
     except Exception as e:
-        print(f"Bluesky error: {e}")
+        print(f"Bluesky error: {describe(e)}")
 
     if not posted:
         return None
@@ -554,15 +657,25 @@ def post_to_bluesky(text, images, video_url, thread=None):
 
 # -------------------------------------------------------------------- main --
 def main():
-    seen, threads = load_state()
+    seen, threads, fails = load_state()
     tweets = fetch_tweets()
 
     if not seen and not threads and SKIP_EXISTING_ON_FIRST_RUN:
         for tw in tweets:
             seen.add(tw["id"])
-        save_state(seen, threads)
+        save_state(seen, threads, fails)
         print("First run: marked existing tweets as seen, nothing posted.")
         return
+
+    if not seen and not threads:
+        # First run: only post the newest FIRST_RUN_LIMIT tweets, plus their replies
+        roots = sorted((t for t in tweets if not t["is_reply"]),
+                       key=lambda t: t["time"], reverse=True)
+        keep = {t["id"] for t in roots[:FIRST_RUN_LIMIT]}
+        for t in tweets:
+            owner = t["parent_id"] if t["is_reply"] else t["id"]
+            if owner not in keep:
+                seen.add(t["id"])
 
     # Oldest first, so a tweet is always posted before its replies
     pending = [t for t in tweets if t["id"] not in seen]
@@ -603,7 +716,6 @@ def main():
             )
             if result:
                 thread["last"] = result["last"]
-                seen.add(tw["id"])
         else:
             print("Reposting:", tw["text"][:80])
             result = post_to_bluesky(tw["text"], tw["images"], tw["video_url"])
@@ -614,11 +726,24 @@ def main():
                     "key": first_line_key(tw["text"]),
                     "time": tw["time"],
                 }
+
+        if result:
+            seen.add(tw["id"])
+        else:
+            n = fails.get(tw["id"], 0) + 1
+            fails[tw["id"]] = n
+            if n >= MAX_ATTEMPTS:
+                print(f"Giving up on this tweet after {n} runs: {tw['text'][:60]}")
                 seen.add(tw["id"])
+            else:
+                # Stop here so newer tweets don't get posted ahead of this one
+                print("Could not post this tweet. Stopping so the order stays correct; will retry next run.")
+                save_state(seen, threads, fails)
+                return
 
-        save_state(seen, threads)   # save as we go, in case a later one crashes
+        save_state(seen, threads, fails)   # save as we go, in case a later one crashes
 
-    save_state(seen, threads)
+    save_state(seen, threads, fails)
 
 
 if __name__ == "__main__":
