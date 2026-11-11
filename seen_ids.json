@@ -1,5 +1,24 @@
 {
- "seen": [],
- "threads": {},
- "fails": {}
+ "seen": [
+  "2119731867389956195",
+  "2119734239872868569",
+  "2120003674747638057",
+  "2120003846928003525"
+ ],
+ "threads": {
+  "2120003674747638057": {
+   "root": {
+    "uri": "at://did:plc:ycii32jukkdws46sq6etabsv/app.bsky.feed.post/3n2334qt2vw24",
+    "cid": "bafyreie7mk5ndqjm6yphjr4elf2fq5mpug3l6wj3hw5tpocmjoftvcgd7y"
+   },
+   "last": {
+    "uri": "at://did:plc:ycii32jukkdws46sq6etabsv/app.bsky.feed.post/3n2334svgz22l",
+    "cid": "bafyreid6qhiwzkesai3rvzt7bg7g5s2d3lkoondh7qtf5fxt4tzkwe3esi"
+   },
+   "time": 1794283238
+  }
+ },
+ "fails": {
+  "2120006313849843881": 1
+ }
 }
