@@ -1,12 +1,12 @@
-# ARTMS Twitter → Bluesky Mirror Bot
+# Twitter → Bluesky Mirror Bot
 
-Automatically mirrors tweets from [@official_artms](https://x.com/official_artms) to Bluesky, including images, clickable hashtags, and hyperlinks.
+Automatically mirrors tweets to Bluesky, including images, clickable hashtags, and hyperlinks.
 
 > ⚠️ This project was vibe coded with the help of [Claude](https://claude.ai) by someone who can't code well. It works though!
 
 **Example Accounts**
-- Twitter Account: [@official_artms](https://x.com/official_artms)
-- Bluesky Mirror: [@notofficialartms.bsky.social](https://bsky.app/profile/notofficialartms.bsky.social)
+- Twitter Account: 
+- Bluesky Mirror: 
 
 ---
 
@@ -14,7 +14,7 @@ Automatically mirrors tweets from [@official_artms](https://x.com/official_artms
 
 This lightweight Python bot will:
 
-1. **Fetch** the latest tweets (excluding retweets/replies) from the ARTMS Twitter account via a [Nitter](https://nitter.net) RSS feed — no Twitter API key required
+1. **Fetch** the latest tweets (excluding retweets/replies) from the ARTMS Twitter account via a [xitter](https://xitter.cf/) RSS feed — no Twitter API key required
 2. **Parse** images from the RSS feed and upload them to Bluesky
 3. **Annotate** hashtags and URLs as proper clickable facets on Bluesky
 4. **Repost** each new tweet as a Bluesky post using the AT Protocol client
