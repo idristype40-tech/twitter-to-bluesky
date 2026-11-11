@@ -2,7 +2,7 @@
 
 Automatically mirrors tweets to Bluesky, including images, clickable hashtags, and hyperlinks.
 
-> ⚠️ This project was vibe coded with the help of [Claude](https://claude.ai) by someone who can't code well. It works though!
+
 
 **Example Accounts**
 - Twitter Account: 
@@ -14,7 +14,7 @@ Automatically mirrors tweets to Bluesky, including images, clickable hashtags, a
 
 This lightweight Python bot will:
 
-1. **Fetch** the latest tweets (excluding retweets/replies) from the ARTMS Twitter account via a [xitter](https://xitter.cf/) RSS feed — no Twitter API key required
+1. **Fetch** the latest tweets (excluding retweets/replies) from the Infinity Nikki Twitter account via a [xitter](https://xitter.cf/) RSS feed — no Twitter API key required
 2. **Parse** images from the RSS feed and upload them to Bluesky
 3. **Annotate** hashtags and URLs as proper clickable facets on Bluesky
 4. **Repost** each new tweet as a Bluesky post using the AT Protocol client
@@ -33,7 +33,7 @@ This lightweight Python bot will:
   - [`requests`](https://pypi.org/project/requests/) — HTTP client for image downloads
   - [`beautifulsoup4`](https://pypi.org/project/beautifulsoup4/) — HTML parser for extracting images from RSS
 - **External Services**
-  - **Nitter RSS** — scrape-free Twitter feed via `https://nitter.net/<handle>/rss`
+  - **xitter RSS** — scrape-free Twitter feed via `https://xitter.net/<handle>/rss`
   - **Bluesky AT Protocol** — post content to Bluesky
 - **State Persistence**
   - `seen_ids.json` — local JSON file storing reposted tweet IDs
@@ -121,16 +121,16 @@ No Twitter API key, no external servers, no credit card — everything runs on G
 
 ## How It Works
 
-1. **Fetch RSS** from `https://nitter.net/official_artms/rss`
+1. **Fetch RSS** from `https://xitter.net/infinitynikkien/rss`
 2. **Filter** out retweets and replies
-3. **Extract images** from the RSS `<description>` HTML and convert Nitter image URLs to real Twitter CDN URLs
+3. **Extract images** from the RSS `<description>` HTML and convert xitter image URLs to real Twitter CDN URLs
 4. **Parse facets** — detect URLs and hashtags in the tweet text and annotate them for Bluesky's rich text system (required for clickable links/hashtags)
 5. **Upload images** to Bluesky and attach them as an embed
 6. **Post** to Bluesky with text, facets, and images
 7. **Persist state** in `seen_ids.json` and push back to GitHub
 
-## Why Nitter instead of the Twitter API?
+## Why xitter instead of the Twitter API?
 
-The Twitter/X API now costs $200/month for basic read access. Nitter is an open-source Twitter front-end that exposes a free RSS feed, requiring no API key or authentication. This project uses that RSS feed instead.
+The Twitter/X API now costs $200/month for basic read access. Nittxitterer is an open-source Twitter front-end that exposes a free RSS feed, requiring no API key or authentication. This project uses that RSS feed instead.
 
-Please be considerate of Nitter instance maintainers — the 30 minute poll interval is intentional to avoid hammering their servers.
+Please be considerate of xitter instance maintainers — the 30 minute poll interval is intentional to avoid hammering their servers.
