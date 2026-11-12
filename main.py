@@ -33,11 +33,11 @@ FIRST_RUN_LIMIT = 10         # on the very first run, only post this many newest
 MAX_ATTEMPTS = 3             # give up on a tweet that fails this many runs in a row
 PINNED = "PINNED"            # marker: the reply sits under the pinned tweet
 
-VIDEO_WAIT_SECONDS = 180     # how long to wait for Bluesky to process a video
+VIDEO_WAIT_SECONDS = 1200    # how long to wait for Bluesky to process a video (big ones take longer)
 OCR_ALT_TEXT = True          # read text inside images (RapidOCR) and use it as alt text
 OCR_MIN_SCORE = 0.6          # ignore OCR lines it is less sure about (0 to 1)
 MAX_VIDEO_SECONDS = 600
-MAX_VIDEO_BYTES = 100 * 1024 * 1024
+MAX_VIDEO_BYTES = 280 * 1024 * 1024   # Bluesky's reported limit is 300 MB; keep headroom
 MAX_VIDEO_HEIGHT = 1080
 
 
@@ -85,6 +85,42 @@ def split_text(text, limit=290):
                 cur += sep + word
     if cur:
         chunks.append(cur)
+    return chunks
+
+
+def split_hashtags(text):
+    """Take the hashtag lines off the end of a tweet. Returns (body, "#tag #tag")."""
+    lines = text.split("\n")
+    tags = []
+    while lines and lines[-1].strip() and all(w.startswith("#") for w in lines[-1].split()):
+        tags = lines.pop().split() + tags
+    return "\n".join(lines).rstrip(), " ".join(tags)
+
+
+def chunk_text(text, limit=290):
+    """Split a tweet into posts. The hashtags go on the end of the first post.
+    The first post only breaks between whole sentences; later replies may break anywhere."""
+    body, tags = split_hashtags(text)
+    if not body:
+        return split_text(text, limit)
+    reserve = len(tags) + 2 if tags else 0          # room for "\n" + the hashtags
+    room = limit - reserve
+
+    pieces = re.split(r"((?<=[.!?])[ \t]+|\n+)", body)
+    texts, seps = pieces[0::2], pieces[1::2]
+    head, used = "", 0
+    for k, piece in enumerate(texts):
+        cand = (head + seps[k - 1] if head else "") + piece
+        if len(cand) > room:
+            break
+        head, used = cand, k + 1
+    if used == 0:                                    # one sentence longer than a post
+        head = split_text(body, room)[0]
+    rest = body[len(head):].lstrip()
+
+    chunks = [head + ("\n" + tags if tags else "")]
+    if rest:
+        chunks += split_text(rest, limit)
     return chunks
 
 
@@ -283,7 +319,8 @@ def download_video(url):
             scale = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
 
         length = min(duration, MAX_VIDEO_SECONDS) if duration > 0 else MAX_VIDEO_SECONDS
-        kbps = max(500, int(MAX_VIDEO_BYTES * 8 / length / 1000) - 128)
+        # aim ~10% under the cap so the encoded file lands inside it
+        kbps = max(500, int(MAX_VIDEO_BYTES * 0.9 * 8 / length / 1000) - 128)
 
         result = subprocess.run([
             "ffmpeg", "-y", "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
@@ -387,6 +424,27 @@ def fix_brand(text):
     return " ".join(result)
 
 
+def sentence_case(text):
+    """Change ALL-CAPS words to normal lowercase, then capitalise sentence starts.
+    The brand name keeps its normal capitals."""
+    words = []
+    for w in text.split():
+        letters = re.sub(r"[^A-Za-z]", "", w)
+        words.append(w.lower() if len(letters) >= 2 and letters.isupper() else w)
+    text = " ".join(words)
+    text = re.sub(r"(?i)\binfinity nikki\b", BRAND, text)
+    return re.sub(r"(^|[.!?:]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), text)
+
+
+def looks_like_sentence(line):
+    """A line that is a description rather than a title or name: long, or ends with
+    punctuation, or has a comma. Titles and names (short, no punctuation) are left alone."""
+    words = line.split()
+    if not words:
+        return False
+    return len(words) >= 6 or line.rstrip()[-1] in ".!?" or "," in line
+
+
 def ocr_alt_text(data):
     """Read any text in the image and return it as alt text ('' if none found)."""
     if not OCR_ALT_TEXT:
@@ -402,24 +460,56 @@ def ocr_alt_text(data):
         return ""
     if not lines:
         return ""
+    # Titles and names keep their casing; descriptions in capitals become sentence case
+    lines = [sentence_case(l) if looks_like_sentence(l) and l.isupper() else l for l in lines]
     text = fix_brand(" ".join(lines))
     print(f"Alt text: {text[:80]}")
     return ("Text in image: " + text)[:1000]
 
 
+BLUESKY_IMAGE_LIMIT = 950_000     # Bluesky rejects image uploads over about 1 MB
+
+
+def full_res_url(url):
+    """Ask Twitter's image server for the original size instead of a small copy."""
+    if "pbs.twimg.com" not in url:
+        return url
+    base = url.split("?")[0]
+    fmt = re.search(r"\.(jpg|jpeg|png|webp)$", base, re.I)
+    return f"{base}?format={fmt.group(1).lower() if fmt else 'jpg'}&name=orig"
+
+
+def fit_for_bluesky(data, limit=BLUESKY_IMAGE_LIMIT):
+    """Shrink a big image just enough to upload it (keeps full resolution when it's small enough)."""
+    if len(data) <= limit:
+        return data
+    img = Image.open(io.BytesIO(data)).convert("RGB")
+    scale = 1.0
+    while scale >= 0.3:
+        size = (int(img.width * scale), int(img.height * scale))
+        resized = img if scale == 1.0 else img.resize(size, Image.LANCZOS)
+        for quality in (95, 90, 85, 80, 70):
+            buf = io.BytesIO()
+            resized.save(buf, "JPEG", quality=quality, optimize=True)
+            if buf.tell() <= limit:
+                return buf.getvalue()
+        scale *= 0.85
+    raise RuntimeError("image could not be made small enough to upload")
+
+
 def build_embed(bsky, images, video_url):
     """Upload the media and return an embed for the first post (or None)."""
     if video_url:
+        # Never fall back to text-only here: raise, so the tweet is retried next run
         path = download_video(video_url)
         if not path:
-            return None
+            raise RuntimeError("video could not be prepared; retrying next run")
         try:
             width, height, _ = probe_video(path)
             with open(path, "rb") as f:
                 blob = upload_blob(bsky, f.read())
         except Exception as e:
-            print(f"Video upload failed: {describe(e)}")
-            return None
+            raise RuntimeError(f"video upload failed ({describe(e)}); retrying next run")
         finally:
             os.unlink(path)
         ratio = (models.AppBskyEmbedDefs.AspectRatio(width=width, height=height)
@@ -429,10 +519,12 @@ def build_embed(bsky, images, video_url):
     uploaded = []
     for url in images[:4]:
         try:
-            data = requests.get(url, timeout=10).content
+            original = requests.get(full_res_url(url), timeout=30).content
+            alt = ocr_alt_text(original)          # read text from the full-size image
+            data = fit_for_bluesky(original)      # then shrink only if needed to upload
             width, height = image_size(data)
             uploaded.append(models.AppBskyEmbedImages.Image(
-                image=upload_blob(bsky, data), alt=ocr_alt_text(data),
+                image=upload_blob(bsky, data), alt=alt,
                 aspect_ratio=(models.AppBskyEmbedDefs.AspectRatio(width=width, height=height)
                               if width and height else None),
             ))
@@ -490,36 +582,35 @@ def recent_posts(limit=100):
     return posts
 
 
-def find_posted(posts, text, parent_uri=None, not_before=0):
+def find_posted(posts, chunks, parent_uri=None, not_before=0):
     """Is this tweet already on Bluesky? Looks for a post with the same text under
     `parent_uri` (None = top level), made at/after `not_before` so an old tweet with
     the same wording isn't mistaken for it. Returns {"first": post, "last": post} or None."""
-    chunks = split_text(text)
     first = next((p for p in posts or []
                   if p["text"] == chunks[0] and p["parent"] == parent_uri
                   and p["created"] >= not_before), None) if chunks else None
     if not first:
         return None
-    last = first
+    last, found = first, 1
     for chunk in chunks[1:]:                       # follow the rest of a long thread
         nxt = next((p for p in posts if p["parent"] == last["uri"] and p["text"] == chunk), None)
         if not nxt:
             break
-        last = nxt
-    return {"first": first, "last": last}
+        last, found = nxt, found + 1
+    return {"first": first, "last": last, "found": found}
 
 
 def ref(d):
     return models.ComAtprotoRepoStrongRef.Main(uri=d["uri"], cid=d["cid"])
 
 
-def post_to_bluesky(text, images, video_url, thread=None):
+def post_to_bluesky(text, images, video_url, thread=None, chunks=None):
     """Post `text` (split into a thread if long); media goes on the first post.
     If `thread` ({"root": ..., "last": ...}) is given, the posts are added to
     the end of it. Returns {"root": ..., "last": ...} or None if nothing posted."""
     root = parent = None
     posted = 0
-    chunks = split_text(text) or [""]
+    chunks = chunks or chunk_text(text) or [""]
 
     try:
         bsky = get_client()
@@ -546,7 +637,7 @@ def post_to_bluesky(text, images, video_url, thread=None):
                 posts_now = recent_posts(30)
                 if posts_now is None:
                     raise RuntimeError("could not check whether the video post went through; retrying next run")
-                hit = find_posted(posts_now, chunk, parent.uri if parent else None,
+                hit = find_posted(posts_now, chunks, parent.uri if parent else None,
                                   time.time() - 900)
                 if not hit:
                     raise RuntimeError("video post did not go through; retrying next run")
@@ -620,7 +711,7 @@ def main():
         if tw["text"]:
             if posts is None:
                 posts = recent_posts() or []
-            hit = find_posted(posts, tw["text"], thread["last"]["uri"] if thread else None,
+            hit = find_posted(posts, chunk_text(tw["text"]), thread["last"]["uri"] if thread else None,
                               tw["time"] - 60)
 
         if hit:
@@ -629,6 +720,12 @@ def main():
                 "root": thread["root"] if thread else {"uri": hit["first"]["uri"], "cid": hit["first"]["cid"]},
                 "last": {"uri": hit["last"]["uri"], "cid": hit["last"]["cid"]},
             }
+            # an earlier run stopped partway through this tweet: post the missing parts as replies
+            missing = chunk_text(tw["text"])[hit["found"]:] if tw["text"] else []
+            if missing:
+                print(f"Only {hit['found']} part(s) were posted earlier; posting the rest")
+                more = post_to_bluesky("", [], None, thread=result, chunks=missing)
+                result = more and {"root": result["root"], "last": more["last"]}
         else:
             print("Posting reply:" if thread else "Reposting:", label)
             video_url = find_video(tw["video_path"]) if tw["video_path"] else None
