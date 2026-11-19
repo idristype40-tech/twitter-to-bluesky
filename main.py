@@ -467,7 +467,7 @@ def ocr_alt_text(data):
     return ("Text in image: " + text)[:1000]
 
 
-BLUESKY_IMAGE_LIMIT = 950_000     # Bluesky rejects image uploads over about 1 MB
+BLUESKY_IMAGE_LIMIT = 1_900_000   # Bluesky's per-image limit is 2 MB; keep a little headroom
 
 
 def full_res_url(url):
@@ -517,7 +517,7 @@ def build_embed(bsky, images, video_url):
         return models.AppBskyEmbedVideo.Main(video=blob, aspect_ratio=ratio)
 
     uploaded = []
-    for url in images[:4]:
+    for url in images[:10]:          # Bluesky allows up to 10 images per post
         try:
             original = requests.get(full_res_url(url), timeout=30).content
             alt = ocr_alt_text(original)          # read text from the full-size image
