@@ -175,6 +175,23 @@ def find_video(tweet_path):
                 return url
     except Exception as e:
         print(f"vxtwitter video lookup failed: {e}")
+    return ytdlp_video(tweet_path)
+ 
+ 
+def ytdlp_video(tweet_path):
+    """Last resort: ask yt-dlp for the tweet's video file directly from X."""
+    try:
+        import yt_dlp
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True,
+                               "format": "best[ext=mp4]/best"}) as ydl:
+            info = ydl.extract_info("https://x.com" + tweet_path, download=False)
+        url = info.get("url") or (info.get("requested_downloads") or [{}])[0].get("url")
+        if url:
+            print("Video found with yt-dlp")
+            return url
+        print("yt-dlp found no video")
+    except Exception as e:
+        print(f"yt-dlp video lookup failed: {describe(e)}")
     return None
  
  
@@ -301,16 +318,38 @@ def probe_video(path):
         return 0, 0, 0
  
  
+def download_source(url):
+    """Save the original video to a local file, so it can be measured and converted
+    reliably (probing a remote file over the network can time out)."""
+    src = tempfile.NamedTemporaryFile(suffix=".src", delete=False)
+    try:
+        with requests.get(url, stream=True, timeout=60,
+                          headers={"User-Agent": "Mozilla/5.0"}) as r:
+            r.raise_for_status()
+            for chunk in r.iter_content(1 << 20):
+                src.write(chunk)
+    except Exception:
+        src.close()
+        os.unlink(src.name)
+        raise
+    src.close()
+    return src.name
+ 
+ 
 def download_video(url):
     """Download a video and convert it to a Bluesky-friendly mp4 (h264/aac),
     within the length, size and resolution limits. Returns a file path or None."""
-    out = None
+    out = src = None
     try:
+        src = download_source(url)
+        width, height, duration = probe_video(src)
+        print(f"Source video: {width}x{height}, {duration:.1f}s")
+        if not duration:
+            # Without the length we can't size the file, so retry next run instead
+            raise RuntimeError("could not read the video's length; retrying next run")
+ 
         out = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
         out.close()
- 
-        width, height, duration = probe_video(url)
-        print(f"Source video: {width}x{height}, {duration:.1f}s")
  
         # Only the SHORT side is limited to 1080
         if width and height and min(width, height) > MAX_VIDEO_HEIGHT:
@@ -324,8 +363,7 @@ def download_video(url):
         kbps = max(500, int(MAX_VIDEO_BYTES * 0.9 * 8 / length / 1000) - 128)
  
         result = subprocess.run([
-            "ffmpeg", "-y", "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-            "-i", url, "-t", str(length), "-vf", scale,
+            "ffmpeg", "-y", "-i", src, "-t", str(length), "-vf", scale,
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
             "-maxrate", f"{kbps}k", "-bufsize", f"{kbps * 2}k",
             "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out.name,
@@ -339,11 +377,17 @@ def download_video(url):
             if size <= MAX_VIDEO_BYTES:
                 return out.name
             print("Video is over the size limit, skipping it")
+        if out and os.path.exists(out.name):
+            os.unlink(out.name)
+        return None
     except Exception as e:
         print(f"Video download failed: {e}")
-    if out and os.path.exists(out.name):
-        os.unlink(out.name)
-    return None
+        if out and os.path.exists(out.name):
+            os.unlink(out.name)
+        return None
+    finally:
+        if src and os.path.exists(src):
+            os.unlink(src)
  
  
 # ----------------------------------------------------------------- bluesky --
